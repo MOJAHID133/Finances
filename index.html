@@ -318,11 +318,42 @@ input.mamt{width:96px;min-height:34px;padding:5px 8px;flex:0 0 auto}
   let fdb=null,fauth=null;
   const col=n=>fdb.collection(n);
   const linkedUidOf=pid=>(S.people.get(pid)||{}).linkedUid||null;
-  function cleanEntry(e){return{personId:e.personId,type:e.type,amount:Math.round(Number(e.amount)*100)/100,date:e.date,note:String(e.note||"").slice(0,200),splitId:e.splitId||null,createdAt:e.createdAt||Date.now(),viewerUid:linkedUidOf(e.personId)}}
-  async function saveEntry(entry){await col("entries").doc(entry.id).set(cleanEntry(entry))}
-  async function deleteEntry(id){await col("entries").doc(id).delete()}
-  async function savePerson(id,name){await col("people").doc(id).set({name,linkedUid:null,createdAt:Date.now()})}
-  async function removePerson(id){await col("people").doc(id).delete()}
+  // MODE "owner": your ledger at people/ and entries/.
+  // MODE "member": an approved friend's own private ledger at ledgers/<uid>/..., plus records shared with the owner,
+  // which live in entries/ (stored from the owner's side) and appear here under the virtual person "__owner".
+  let MODE="owner",ME=null,MYPID=null;
+  const OWNER_PID="__owner";
+  const FLIP={lent:"borrowed",borrowed:"lent",repaid:"ipaid",ipaid:"repaid"};
+  const r2=n=>Math.round(Number(n)*100)/100;
+  const peopleCol=()=>MODE==="owner"?col("people"):fdb.collection("ledgers").doc(ME).collection("people");
+  const myEntriesCol=()=>MODE==="owner"?col("entries"):fdb.collection("ledgers").doc(ME).collection("entries");
+  function cleanEntry(e){
+    const base={personId:e.personId,type:e.type,amount:r2(e.amount),date:e.date,note:String(e.note||"").slice(0,200),splitId:e.splitId||null,createdAt:e.createdAt||Date.now()};
+    if(MODE==="member")return base;
+    return{...base,viewerUid:linkedUidOf(e.personId),addedBy:e.addedBy||null};
+  }
+  const canModify=e=>MODE==="owner"||!e.shared||e.addedBy===ME;
+  async function saveEntry(entry){
+    const prev=allEntries().find(x=>x.id===entry.id);
+    if(MODE==="member"){
+      const toShared=entry.personId===OWNER_PID;
+      if(prev&&!!prev.shared!==toShared)await deleteEntry(prev.id);
+      if(toShared){
+        if(!MYPID)throw{code:"permission-denied"};
+        await col("entries").doc(entry.id).set({personId:MYPID,type:FLIP[entry.type],amount:r2(entry.amount),date:entry.date,note:String(entry.note||"").slice(0,200),
+          splitId:entry.splitId||null,createdAt:entry.createdAt||Date.now(),viewerUid:ME,addedBy:ME});
+        return;
+      }
+    }
+    await myEntriesCol().doc(entry.id).set(cleanEntry(entry));
+  }
+  async function deleteEntry(id){
+    const e=allEntries().find(x=>x.id===id);
+    if(MODE==="member"&&e&&e.shared){await col("entries").doc(id).delete();return}
+    await myEntriesCol().doc(id).delete();
+  }
+  async function savePerson(id,name){await peopleCol().doc(id).set(MODE==="owner"?{name,linkedUid:null,createdAt:Date.now()}:{name,createdAt:Date.now()})}
+  async function removePerson(id){await peopleCol().doc(id).delete()}
   async function commitInChunks(ops){ // ops: [fn(batch)]
     for(let i=0;i<ops.length;i+=400){const b=fdb.batch();ops.slice(i,i+400).forEach(op=>op(b));await b.commit()}
   }
@@ -378,19 +409,24 @@ input.mamt{width:96px;min-height:34px;padding:5px 8px;flex:0 0 auto}
       return `<li><button class="person" data-pid="${id}" aria-pressed="${S.filter===id}">
         <span class="avatar" aria-hidden="true">${esc(initials(p.name))}</span>
         <span class="pname">${esc(p.name)}</span>
-        <span class="pbal ${cls}" style="text-align:right">${money(Math.abs(v))}<span class="ptag">${tag}${p.linkedUid?' · <span class="linked">can view</span>':""}</span></span>
+        <span class="pbal ${cls}" style="text-align:right">${money(Math.abs(v))}<span class="ptag">${tag}${p.linkedUid?' · <span class="linked">can view</span>':p.shared?' · <span class="linked">shared</span>':""}</span></span>
       </button></li>`}).join("");
   }
   function personOptions(sel){
     const opts=[...S.people.entries()].sort((a,b)=>a[1].name.localeCompare(b[1].name));
     return `<option value="">Choose…</option>`+opts.map(([id,p])=>`<option value="${id}"${id===sel?" selected":""}>${esc(p.name)}</option>`).join("")+`<option value="__new">+ New person…</option>`;
   }
+  function addedChip(e){
+    const c=t=>`<span class="chip" style="background:var(--accent-soft);color:var(--accent);margin-right:6px">${esc(t)}</span>`;
+    if(MODE==="owner")return e.addedBy?c("added by "+pname(e.personId)):"";
+    return e.shared?c(e.addedBy===ME?"shared · added by you":"shared · added by "+OWNER):"";
+  }
   function filterBar(){
     if(!S.filter)return"";
     const bal=balances().get(S.filter)||0;
     return `<div class="filterbar"><span>Showing only <strong>${esc(pname(S.filter))}</strong></span><span class="spacer"></span>
       ${bal>0.004?`<button class="btn small" data-act="settle">Mark ${money(bal)} paid back to you</button>`:bal<-0.004?`<button class="btn small" data-act="settle">Mark ${money(-bal)} paid to them</button>`:""}
-      ${S.confirmPerson===S.filter?`<span class="confirm">Remove ${esc(pname(S.filter))}?<button class="btn danger small" data-act="rmperson-yes">Remove</button><button class="btn ghost small" data-act="rmperson-no">Keep</button></span>`:`<button class="btn ghost small" data-act="rmperson">Remove person</button>`}
+      ${S.confirmPerson===S.filter?`<span class="confirm">Remove ${esc(pname(S.filter))}?<button class="btn danger small" data-act="rmperson-yes">Remove</button><button class="btn ghost small" data-act="rmperson-no">Keep</button></span>`:(S.filter===OWNER_PID?"":`<button class="btn ghost small" data-act="rmperson">Remove person</button>`)}
       <button class="btn ghost small" data-act="clearfilter">Show everyone</button></div>`;
   }
   function renderMonthView(){
@@ -405,11 +441,11 @@ input.mamt{width:96px;min-height:34px;padding:5px 8px;flex:0 0 auto}
         <td style="font-weight:500">${esc(pname(e.personId))}</td>
         <td><span class="chip ${dir(e.type)}">${TL[e.type]||e.type}</span></td>
         <td class="r num amt ${dir(e.type)}">${money(e.amount)}</td>
-        <td class="note" title="${esc(e.note)}">${esc(e.note)||""}</td>
-        <td><div class="rowact">
+        <td class="note" title="${esc(e.note)}">${addedChip(e)}${esc(e.note)||""}</td>
+        <td>${canModify(e)?`<div class="rowact">
           <button data-act="edit" data-id="${e.id}" aria-label="Edit entry"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></button>
           <button class="del" data-act="del" data-id="${e.id}" aria-label="Delete entry"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>
-        </div></td></tr>`).join("");
+        </div>`:""}</td></tr>`).join("");
     const t=totals(list);
     if(ed)S.mode="entry";
     $("mainCard").innerHTML=`
@@ -571,7 +607,7 @@ input.mamt{width:96px;min-height:34px;padding:5px 8px;flex:0 0 auto}
     else if(act==="rmperson"){S.confirmPerson=S.filter;render()}
     else if(act==="rmperson-no"){S.confirmPerson=null;render()}
     else if(act==="rmperson-yes"){
-      const pid=S.filter;const has=allEntries().some(x=>x.personId===pid);
+      const pid=S.filter;if(pid===OWNER_PID)return;const has=allEntries().some(x=>x.personId===pid);
       if(has){S.confirmPerson=null;toast("Delete this person's entries first, so your history stays complete.");render();return}
       try{await removePerson(pid);S.filter=null;S.confirmPerson=null;toast("Removed");render()}catch(err){fail(err)}
     }
@@ -644,13 +680,13 @@ input.mamt{width:96px;min-height:34px;padding:5px 8px;flex:0 0 auto}
       if(data.app!=="lending-ledger"||!data.people||!data.months)throw new Error("format");
       const ops=[];
       for(const [id,p] of Object.entries(data.people)){
-        if(!S.people.has(id)&&p&&p.name&&/^[A-Za-z0-9_-]{1,64}$/.test(id))ops.push(b=>b.set(col("people").doc(id),{name:String(p.name).slice(0,60),linkedUid:null,createdAt:Date.now()}));
+        if(id!==OWNER_PID&&!S.people.has(id)&&p&&p.name&&/^[A-Za-z0-9_-]{1,64}$/.test(id))ops.push(b=>b.set(peopleCol().doc(id),MODE==="owner"?{name:String(p.name).slice(0,60),linkedUid:null,createdAt:Date.now()}:{name:String(p.name).slice(0,60),createdAt:Date.now()}));
       }
       const have=new Set(allEntries().map(x=>x.id));let n=0;
       for(const [ym,list] of Object.entries(data.months)){
         if(!/^\d{4}-\d{2}$/.test(ym)||!Array.isArray(list))continue;
-        list.filter(x=>x&&x.id&&/^[A-Za-z0-9_-]{1,64}$/.test(x.id)&&!have.has(x.id)&&x.amount>0&&TYPES.includes(x.type)&&/^\d{4}-\d{2}-\d{2}$/.test(x.date))
-          .forEach(x=>{n++;ops.push(b=>b.set(col("entries").doc(x.id),cleanEntry(x)))});
+        list.filter(x=>x&&x.id&&x.personId!==OWNER_PID&&/^[A-Za-z0-9_-]{1,64}$/.test(x.id)&&!have.has(x.id)&&x.amount>0&&TYPES.includes(x.type)&&/^\d{4}-\d{2}-\d{2}$/.test(x.date))
+          .forEach(x=>{n++;ops.push(b=>b.set(myEntriesCol().doc(x.id),cleanEntry(x)))});
       }
       toast("Restoring…");
       await commitInChunks(ops);
@@ -724,54 +760,6 @@ input.mamt{width:96px;min-height:34px;padding:5px 8px;flex:0 0 auto}
   });
 
   // ---------- friend view ----------
-  const FL={lent:"Borrowed from "+OWNER,repaid:"You paid back",borrowed:"You lent",ipaid:OWNER+" paid you back"};
-  const F={entries:[],year:now.getFullYear(),name:"",ready:false};
-  function renderFriend(){
-    const v=$("friendView");
-    const bal=F.entries.reduce((s,e)=>s+signed(e),0);
-    const years=[...new Set(F.entries.map(e=>+e.date.slice(0,4)))];
-    const list=F.entries.filter(e=>+e.date.slice(0,4)===F.year).sort((a,b)=>a.date<b.date?1:a.date>b.date?-1:(b.createdAt||0)-(a.createdAt||0));
-    const t=totals(list);
-    const byMonth=new Map();list.forEach(e=>{const m=+e.date.slice(5,7)-1;(byMonth.get(m)||byMonth.set(m,[]).get(m)).push(e)});
-    const balCls=bal<-0.004?"fr-bal owe":"fr-bal";
-    const balLbl=bal>0.004?"You owe "+esc(OWNER):bal<-0.004?esc(OWNER)+" owes you":"All settled";
-    v.innerHTML=`
-      <header class="top"><div class="wrap"><div class="top-row">
-        <h1 class="brand"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h12a4 4 0 0 1 4 4v12H8a4 4 0 0 1-4-4z"/><path d="M8 9h8M8 13h8M8 17h5"/></svg>${esc(OWNER)}'s ledger</h1>
-        <div class="spacer"></div><span class="who-chip">${esc(F.name)}</span>
-        <button class="btn ghost small" data-fr="signout">Sign out</button></div></div></header>
-      <main class="wrap fr-main">
-        <section class="${balCls}" aria-label="Your balance"><div class="lbl">${balLbl}</div><div class="val">${money(Math.abs(bal))}</div>
-          <div class="sub">${F.ready?"Across everything you and "+esc(OWNER)+" have recorded.":"Loading…"}</div></section>
-        <section class="card">
-          <div class="card-h"><h2>Your history</h2>
-            <div class="yearpick"><button class="icon-btn" data-fr="prev" aria-label="Previous year"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg></button>
-            <span class="year num">${F.year}</span>
-            <button class="icon-btn" data-fr="next" aria-label="Next year"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></button></div></div>
-          ${list.length?`<div class="filterbar" style="background:var(--bg)"><span>${F.year}: ${esc(OWNER)} gave you <strong class="num">${money(t.l)}</strong>, you gave ${esc(OWNER)} <strong class="num">${money(t.r)}</strong></span></div>
-            ${[...byMonth.entries()].map(([m,es])=>`<div class="fr-month">${MONTHS_FULL[m]}</div><div class="tablebox"><table><tbody>${es.map(e=>`<tr>
-              <td class="num" style="white-space:nowrap;width:70px">${e.date.slice(5,7)}/${e.date.slice(8,10)}</td>
-              <td><span class="chip ${dir(e.type)}">${esc(FL[e.type]||e.type)}</span></td>
-              <td class="note" title="${esc(e.note)}">${esc(e.note)}</td>
-              <td class="r num amt ${dir(e.type)}">${money(e.amount)}</td></tr>`).join("")}</tbody></table></div>`).join("")}`
-          :`<div class="empty"><strong>Nothing in ${F.year}</strong>${years.length?"Use the arrows to see other years.":"When "+esc(OWNER)+" records money between you, it will show up here."}</div>`}
-        </section>
-        ${F.entries.length?`<div><button class="btn ghost small" data-fr="csv">Download my statement (CSV)</button></div>`:""}
-        <p class="fine">Only you and ${esc(OWNER)} can see this page. Spot a mistake? Tell ${esc(OWNER)} directly.</p>
-      </main>`;
-  }
-  $("friendView").addEventListener("click",e=>{
-    const b=e.target.closest("[data-fr]");if(!b)return;const a=b.dataset.fr;
-    if(a==="signout")fauth.signOut();
-    else if(a==="prev"){F.year--;renderFriend()}
-    else if(a==="next"){F.year++;renderFriend()}
-    else if(a==="csv"){
-      const rows=[["Date","What happened","Amount (USD)","Note"]];
-      F.entries.slice().sort((x,y)=>x.date<y.date?-1:1).forEach(x=>rows.push([x.date,FL[x.type]||x.type,x.amount.toFixed(2),x.note||""]));
-      offer("my-statement-"+todayISO()+".csv",rows.map(r=>r.map(c=>/[",\n]/.test(c)?'"'+String(c).replace(/"/g,'""')+'"':c).join(",")).join("\n"));
-    }
-  });
-
   // ---------- sign-in, request access, pending ----------
   const AUTH={mode:"signin",msg:"",ok:false,busy:false,profileDraft:null};
   const shell=inner=>`<div class="wrap auth-wrap"><div class="auth-card">
@@ -903,24 +891,42 @@ input.mamt{width:96px;min-height:34px;padding:5px 8px;flex:0 0 auto}
   const stopAll=()=>{unsubs.forEach(u=>{try{u()}catch(e){}});unsubs=[]};
   const isAdminEmail=u=>!!(u&&u.email&&CFG.adminEmail&&u.email.toLowerCase()===String(CFG.adminEmail).trim().toLowerCase());
   const dbErr=err=>{console.error(err);if(err&&err.code==="permission-denied")toast("Access denied. If this is your ledger, check the admin email in firestore rules and firebase-config.js.");else toast("Lost connection to the ledger. Reload the page.")};
+  const brandEl=()=>$("adminView").querySelector(".brand");
+  function resetLedger(){S.people=new Map();S.months=new Map();S.filter=null;S.editing=null;S.confirmDel=null;S.confirmPerson=null;S.users=[];S.split=newSplit();S.ready=false}
   function startAdmin(){
-    showView("adminView");S.ready=false;render();
+    MODE="owner";ME=null;MYPID=null;resetLedger();
+    $("requests").hidden=false;brandEl().lastChild.textContent="Lending Ledger";
+    showView("adminView");render();
     let gotP=false,gotE=false;const done=()=>{if(gotP&&gotE)S.ready=true;render();renderAccess()};
     unsubs.push(col("people").onSnapshot(snap=>{const m=new Map();snap.docs.forEach(d=>{const v=d.data();if(v&&v.name)m.set(d.id,{name:v.name,linkedUid:v.linkedUid||null})});S.people=m;gotP=true;done()},dbErr));
     unsubs.push(col("entries").onSnapshot(snap=>{const m=new Map();snap.docs.forEach(d=>{const v=d.data();if(!v||!v.date)return;
-      const e={id:d.id,personId:v.personId,type:v.type,amount:Number(v.amount)||0,date:v.date,note:v.note||"",splitId:v.splitId||null,createdAt:v.createdAt||0};
+      const e={id:d.id,personId:v.personId,type:v.type,amount:Number(v.amount)||0,date:v.date,note:v.note||"",splitId:v.splitId||null,createdAt:v.createdAt||0,addedBy:v.addedBy||null};
       const ym=v.date.slice(0,7);(m.get(ym)||m.set(ym,[]).get(ym)).push(e)});S.months=m;gotE=true;done()},dbErr));
     unsubs.push(col("users").onSnapshot(snap=>{S.users=snap.docs.map(d=>({uid:d.id,...d.data()})).sort((a,b)=>String(a.name).localeCompare(String(b.name)));renderAccess()},dbErr));
     if(location.hash==="#requests")setTimeout(()=>{const r=$("requests");if(r)r.scrollIntoView({behavior:"smooth"})},400);
   }
-  function startFriend(user,data){
-    showView("friendView");F.name=data.name||user.email;F.entries=[];F.ready=false;renderFriend();
-    unsubs.push(col("entries").where("viewerUid","==",user.uid).onSnapshot(snap=>{
-      F.entries=snap.docs.map(d=>{const v=d.data();return{id:d.id,type:v.type,amount:Number(v.amount)||0,date:v.date||"",note:v.note||"",createdAt:v.createdAt||0}}).filter(x=>x.date);
-      F.ready=true;renderFriend()},err=>{console.error(err);F.ready=true;renderFriend()}));
+  let memberUnsubs=[];
+  const stopMember=()=>{memberUnsubs.forEach(u=>{try{u()}catch(e){}});memberUnsubs=[]};
+  function startMember(user,data){
+    stopMember();
+    MODE="member";ME=user.uid;MYPID=data.personId||null;resetLedger();
+    $("requests").hidden=true;brandEl().lastChild.textContent="My Ledger";
+    showView("adminView");render();
+    let own=new Map(),ownE=[],shared=[],got={p:false,e:false,s:false};
+    const rebuild=()=>{
+      S.people=new Map([...own,[OWNER_PID,{name:OWNER,shared:true}]]);
+      const m=new Map();
+      [...ownE,...shared].forEach(e=>{const ym=e.date.slice(0,7);(m.get(ym)||m.set(ym,[]).get(ym)).push(e)});
+      S.months=m;if(got.p&&got.e&&got.s)S.ready=true;render();
+    };
+    const mErr=err=>{console.error(err);if(err&&err.code==="permission-denied")toast("Your access has changed. Reload the page.");else toast("Lost connection. Reload the page.")};
+    const base=fdb.collection("ledgers").doc(ME);
+    memberUnsubs.push(base.collection("people").onSnapshot(snap=>{own=new Map();snap.docs.forEach(d=>{const v=d.data();if(v&&v.name&&d.id!==OWNER_PID)own.set(d.id,{name:v.name})});got.p=true;rebuild()},mErr));
+    memberUnsubs.push(base.collection("entries").onSnapshot(snap=>{ownE=snap.docs.map(d=>{const v=d.data();return{id:d.id,personId:v.personId,type:v.type,amount:Number(v.amount)||0,date:v.date||"",note:v.note||"",splitId:v.splitId||null,createdAt:v.createdAt||0}}).filter(x=>x.date);got.e=true;rebuild()},mErr));
+    memberUnsubs.push(col("entries").where("viewerUid","==",ME).onSnapshot(snap=>{shared=snap.docs.map(d=>{const v=d.data();return{id:d.id,personId:OWNER_PID,type:FLIP[v.type]||v.type,amount:Number(v.amount)||0,date:v.date||"",note:v.note||"",splitId:v.splitId||null,createdAt:v.createdAt||0,addedBy:v.addedBy||null,shared:true}}).filter(x=>x.date);got.s=true;rebuild()},mErr));
   }
   function route(user){
-    stopAll();
+    stopAll();stopMember();
     if(!user){renderAuth("signin");return}
     if(isAdminEmail(user)){
       if(!user.emailVerified){try{if(!AUTH.sentVerify){AUTH.sentVerify=true;user.sendEmailVerification()}}catch(e){}renderAuth("verify",user);return}
@@ -935,8 +941,8 @@ input.mamt{width:96px;min-height:34px;padding:5px 8px;flex:0 0 auto}
         if(mode!=="profile"){mode="profile";renderAuth("profile",user)}return;
       }
       const d=snap.data();
-      if(d.status==="approved"){if(mode!=="friend"){mode="friend";startFriend(user,d)}}
-      else{mode=d.status;renderAuth(d.status==="pending"?"pending":"denied",user,d)}
+      if(d.status==="approved"){if(mode!=="member"||MYPID!==(d.personId||null)){mode="member";startMember(user,d)}}
+      else{stopMember();mode=d.status;renderAuth(d.status==="pending"?"pending":"denied",user,d)}
     },err=>{console.error(err);renderAuth("denied",user)}));
   }
   $("adminSignOut").onclick=()=>fauth.signOut();
