@@ -1,0 +1,68 @@
+rules_version = '2';
+
+// Lending Ledger security rules.
+// Admin email is filled in below (islammojahidul4@gmail.com).
+// It must match adminEmail in firebase-config.js.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Only you: your email, confirmed by Google or by an email link.
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email == 'islammojahidul4@gmail.com'
+        && request.auth.token.email_verified == true;
+    }
+
+    // A friend you have approved.
+    function isApproved() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'approved';
+    }
+
+    // Access requests. Anyone signed in can create ONE request for themselves, always as
+    // "pending". Only you can approve, decline or change it.
+    match /users/{userId} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == userId);
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(['name', 'email', 'phone', 'note', 'status', 'personId', 'createdAt'])
+        && request.resource.data.status == 'pending'
+        && request.resource.data.personId == null
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 60
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() <= 30
+        && request.resource.data.note is string
+        && request.resource.data.note.size() <= 300
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if isAdmin();
+    }
+
+    // The people in your ledger. Only you can read or change them
+    // (an approved friend can read only the one record linked to them).
+    match /people/{personId} {
+      allow read: if isAdmin() || (isApproved() && resource.data.linkedUid == request.auth.uid);
+      allow write: if isAdmin();
+    }
+
+    // Ledger entries. Only you can add, edit or delete.
+    // An approved friend can read only the entries linked to them.
+    match /entries/{entryId} {
+      allow read: if isAdmin() || (isApproved() && resource.data.viewerUid == request.auth.uid);
+      allow write: if isAdmin();
+    }
+
+    // Everything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
